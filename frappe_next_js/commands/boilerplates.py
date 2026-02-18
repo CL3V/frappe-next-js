@@ -12,7 +12,7 @@ NEXTJS_PACKAGE_JSON = """{
     "dev": "next dev --turbopack -p 3000",
     "build": "next build",
     "build:frappe": "next build && npm run export-assets",
-    "export-assets": "rm -rf ../{{ app_package }}/www/{{ spa_name }} && mkdir -p ../{{ app_package }}/www/{{ spa_name }} && cp -r out/* ../{{ app_package }}/www/{{ spa_name }}/",
+    "export-assets": "rm -rf ../{{ app_package }}/www/{{ spa_name }} ../{{ app_package }}/public/{{ spa_name }} && mkdir -p ../{{ app_package }}/www/{{ spa_name }} ../{{ app_package }}/public/{{ spa_name }} && cp -r out/* ../{{ app_package }}/www/{{ spa_name }}/ && mv ../{{ app_package }}/www/{{ spa_name }}/_next ../{{ app_package }}/public/{{ spa_name }}/_next",
     "start": "next start",
     "lint": "next lint"
   },
@@ -56,7 +56,7 @@ NEXTJS_PACKAGE_JSON_JS = """{
     "dev": "next dev --turbopack -p 3000",
     "build": "next build",
     "build:frappe": "next build && npm run export-assets",
-    "export-assets": "rm -rf ../{{ app_package }}/www/{{ spa_name }} && mkdir -p ../{{ app_package }}/www/{{ spa_name }} && cp -r out/* ../{{ app_package }}/www/{{ spa_name }}/",
+    "export-assets": "rm -rf ../{{ app_package }}/www/{{ spa_name }} ../{{ app_package }}/public/{{ spa_name }} && mkdir -p ../{{ app_package }}/www/{{ spa_name }} ../{{ app_package }}/public/{{ spa_name }} && cp -r out/* ../{{ app_package }}/www/{{ spa_name }}/ && mv ../{{ app_package }}/www/{{ spa_name }}/_next ../{{ app_package }}/public/{{ spa_name }}/_next",
     "start": "next start",
     "lint": "next lint"
   },
@@ -99,7 +99,7 @@ const nextConfig = {
   trailingSlash: true,
   images: { unoptimized: true },
   basePath: isDev ? '' : '/{{ spa_name }}',
-  assetPrefix: isDev ? undefined : '/{{ spa_name }}/',
+  assetPrefix: isDev ? undefined : '/assets/{{ app_package }}/{{ spa_name }}/',
   ...(isDev && {
     async rewrites() {
       return [
@@ -1260,6 +1260,37 @@ NEXTJS_APP_PACKAGE_JSON = """{
 # Backward compatibility aliases
 NEXTJS_FRAPPE_PROVIDER_TSX = NEXTJS_FRAPPE_LIB_TSX
 NEXTJS_FRAPPE_PROVIDER_JS = NEXTJS_FRAPPE_LIB_JS
+
+# Page controller for serving Next.js HTML without Jinja (fallback when SPAPage is unavailable)
+SPA_PAGE_PY = """import frappe
+import os
+
+no_cache = 1
+
+ASSET_PREFIX = "/assets/{{ app_package }}/{{ spa_name }}"
+
+
+def get_context(context):
+\tapp_path = frappe.get_app_path("{{ app_package }}")
+\twww_spa = os.path.join(app_path, "www", "{{ spa_name }}")
+
+\t# Resolve the correct HTML file based on the request sub-path
+\trequest_path = (frappe.local.request.path or "").strip("/")
+\tsub_path = request_path[len("{{ spa_name }}"):].strip("/") if request_path.startswith("{{ spa_name }}") else ""
+
+\thtml_path = os.path.join(www_spa, sub_path, "index.html") if sub_path else os.path.join(www_spa, "index.html")
+\tif not os.path.isfile(html_path):
+\t\thtml_path = os.path.join(www_spa, "index.html")
+
+\twith open(html_path) as f:
+\t\thtml = f.read()
+\t# Rewrite old asset paths for builds before assetPrefix was fixed
+\thtml = html.replace('"/{{ spa_name }}/_next/', f'"{ASSET_PREFIX}/_next/')
+\thtml = html.replace("'/{{ spa_name }}/_next/", f"'{ASSET_PREFIX}/_next/")
+\tcontext.page_content = html
+"""
+
+SPA_PAGE_HTML = """{{ page_content | safe }}"""
 
 # Login page (TypeScript)
 NEXTJS_LOGIN_PAGE_TSX = """'use client';

@@ -112,10 +112,13 @@ class NextJSGenerator:
 
         app_package = get_app_package_name(self.app)
         www_path = f"{app_package}/www/{self.spa_name}"
+        public_path = f"{app_package}/public/{self.spa_name}"
         if "node_modules" not in content:
             entries_to_add.append("node_modules")
         if www_path not in content:
             entries_to_add.append(www_path)
+        if public_path not in content:
+            entries_to_add.append(public_path)
 
         if entries_to_add:
             if not content.endswith("\n"):
@@ -249,11 +252,12 @@ class NextJSGenerator:
             click.echo("You can install them manually by running: npm install")
 
     def create_www_directory(self):
-        """Create www directory for the SPA route handler."""
-        www_path = self.app_path / get_app_package_name(self.app) / "www" / self.spa_name
+        """Create www directory and page controller for serving the SPA."""
+        app_package = get_app_package_name(self.app)
+        www_path = self.app_path / app_package / "www" / self.spa_name
         www_path.mkdir(parents=True, exist_ok=True)
-        
-        # Create index.html that will be served
+
+        # Create placeholder index.html (replaced by build:frappe output)
         index_html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -263,15 +267,17 @@ class NextJSGenerator:
 </head>
 <body>
     <div id="root">Loading...</div>
-    <script>
-        // This page is served when accessing /{self.spa_name}
-        // In development, run 'npm run dev' in the {self.spa_name} directory
-        // In production, run 'npm run build' to generate static files
-    </script>
 </body>
 </html>
 """
         create_file(www_path / "index.html", index_html)
+
+        # Create page controller files (serves Next.js HTML bypassing Jinja)
+        www_base = self.app_path / app_package / "www"
+        controller_py = self._render_template(SPA_PAGE_PY)
+        create_file(www_base / f"{self.spa_name}.py", controller_py)
+        controller_html = self._render_template(SPA_PAGE_HTML)
+        create_file(www_base / f"{self.spa_name}.html", controller_html)
 
     def create_shadcn_components(self, components_ui_path: Path, hooks_path: Path):
         """Create shadcn/ui components."""
