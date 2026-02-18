@@ -1,0 +1,21 @@
+{
+  "name": "frappe-next-js",
+  "version": "0.0.1",
+  "description": "A Frappe App to setup and manage Next.js frontends on your custom Frappe App.",
+  "main": "index.js",
+  "scripts": {},
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/frappe-next-js.git"
+  },
+  "keywords": [
+    "frappe",
+    "nextjs",
+    "react",
+    "frontend"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {},
+  "dependencies": {}
+}

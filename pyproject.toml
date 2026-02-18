@@ -1,0 +1,16 @@
+[project]
+name = "frappe_next_js"
+authors = [
+    { name = "Your Name", email = "your@email.com"}
+]
+description = "A Frappe App to setup and manage Next.js frontends on your custom Frappe App."
+requires-python = ">=3.10"
+readme = "README.md"
+dynamic = ["version"]
+
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+[tool.flit.module]
+name = "frappe_next_js"
