@@ -100,15 +100,37 @@ const nextConfig = {
   images: { unoptimized: true },
   basePath: isDev ? '' : '/{{ spa_name }}',
   assetPrefix: isDev ? undefined : '/assets/{{ app_package }}/{{ spa_name }}/',
+  experimental: {
+    optimizePackageImports: [
+      'lucide-react',
+      '@radix-ui/react-dialog',
+      '@radix-ui/react-dropdown-menu',
+      '@radix-ui/react-label',
+      '@radix-ui/react-select',
+      '@radix-ui/react-toast',
+      '@radix-ui/react-slot',
+    ],
+  },
+  async headers() {
+    return [
+      {
+        source: '/_next/static/:path*',
+        headers: [
+          { key: 'Cache-Control', value: 'public, max-age=31536000, immutable' },
+        ],
+      },
+    ];
+  },
   ...(isDev && {
     async rewrites() {
       return [
         { source: '/api/:path*', destination: `${frappeUrl}/api/:path*` },
         { source: '/assets/:path*', destination: `${frappeUrl}/assets/:path*` },
+        { source: '/files/:path*', destination: `${frappeUrl}/files/:path*` },
+        { source: '/private/files/:path*', destination: `${frappeUrl}/private/files/:path*` },
       ];
     },
   }),
-  turbopack: { root: __dirname },
 };
 
 module.exports = nextConfig;
@@ -153,12 +175,34 @@ def get_logged_user():
 
 
 @frappe.whitelist(allow_guest=True)
+def get_csrf_token():
+    """Return CSRF token for cookie-session API calls from the SPA."""
+    from frappe.sessions import get_csrf_token as _get_token
+    return _get_token()
+
+
+@frappe.whitelist(allow_guest=True)
 def check_backend():
     """Return System Settings setup_complete. Safe for guest - used for connection status."""
     try:
         return frappe.db.get_value("System Settings", None, "setup_complete")
     except Exception:
         return None
+
+
+@frappe.whitelist()
+def get_auth_token(user=None):
+    """Return API key/secret for the session user (Authorization: token header for API calls)."""
+    user = user or frappe.session.user
+    if user != frappe.session.user:
+        frappe.throw("You can only generate tokens for your own account", frappe.PermissionError)
+    user_doc = frappe.get_doc("User", user)
+    if not user_doc.api_key:
+        user_doc.api_key = frappe.generate_hash(length=15)
+    api_secret = frappe.generate_hash(length=15)
+    user_doc.api_secret = api_secret
+    user_doc.save(ignore_permissions=True)
+    return {"api_key": user_doc.api_key, "api_secret": api_secret}
 '''
 
 # .env.local template
@@ -260,7 +304,7 @@ function AppNotInstalled() {
 }
 
 export default function Home() {
-  const { user, isLoggedIn, logout } = useFrappe();
+  const { user, isLoggedIn, logout, authLoading } = useFrappe();
   const { toast } = useToast();
 
   const systemSettings = useResource({
@@ -270,6 +314,14 @@ export default function Home() {
   });
 
   const isNotInstalled = systemSettings.error?.message?.includes('not installed');
+
+  if (authLoading) {
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center p-8">
+        <p className="text-muted-foreground">Loading session...</p>
+      </main>
+    );
+  }
 
   const handleLogout = async () => {
     try {
@@ -370,7 +422,7 @@ function AppNotInstalled() {
 }
 
 export default function Home() {
-  const { user, isLoggedIn, logout } = useFrappe();
+  const { user, isLoggedIn, logout, authLoading } = useFrappe();
   const { toast } = useToast();
 
   const systemSettings = useResource({
@@ -380,6 +432,14 @@ export default function Home() {
   });
 
   const isNotInstalled = systemSettings.error?.message?.includes('not installed');
+
+  if (authLoading) {
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center p-8">
+        <p className="text-muted-foreground">Loading session...</p>
+      </main>
+    );
+  }
 
   const handleLogout = async () => {
     try {
@@ -487,10 +547,18 @@ NEXTJS_GLOBALS_CSS = """@tailwind base;
 }
 """
 
-# createResource and Frappe utilities (TypeScript)
+# createResource and Frappe utilities (TypeScript) — CSRF, GET/POST call, API token auth
 NEXTJS_FRAPPE_LIB_TSX = """'use client';
 
-import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
+import {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+  ReactNode,
+} from 'react';
 
 // Types
 interface ResourceOptions {
@@ -528,66 +596,176 @@ interface DocResourceOptions {
   auto?: boolean;
 }
 
-// Frappe API call function
-// Use empty string in dev to go through Next.js rewrites proxy (avoids CORS)
 const FRAPPE_URL = '';
+const API = '{{ app_package }}.api';
 
-export async function call<T = any>(method: string, params?: Record<string, any>): Promise<T> {
-  const response = await fetch(`${FRAPPE_URL}/api/method/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-    credentials: 'include',
-    body: JSON.stringify(params || {}),
-  });
+let _authToken: string | null = null;
+let _csrfToken: string | null = null;
+
+function setAuthToken(token: string | null) {
+  _authToken = token;
+}
+
+export function getAuthToken(): string | null {
+  return _authToken;
+}
+
+function getHeaders(includeBody = true): Record<string, string> {
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  if (includeBody) {
+    headers['Content-Type'] = 'application/json';
+  }
+  if (_authToken) {
+    headers['Authorization'] = `token ${_authToken}`;
+  }
+  if (_csrfToken) {
+    headers['X-Frappe-CSRF-Token'] = _csrfToken;
+  }
+  return headers;
+}
+
+let _csrfPromise: Promise<void> | null = null;
+
+async function ensureCsrfToken(): Promise<void> {
+  if (_csrfToken || _authToken) return;
+  if (_csrfPromise) return _csrfPromise;
+  _csrfPromise = (async () => {
+    try {
+      const res = await fetch(`${FRAPPE_URL}/api/method/${API}.get_csrf_token`, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        credentials: 'include',
+      });
+      if (res.ok) {
+        const json = await res.json();
+        _csrfToken = json.message ?? null;
+      }
+    } catch {
+      /* guest CSRF optional */
+    }
+  })();
+  await _csrfPromise;
+  _csrfPromise = null;
+}
+
+function extractServerMessage(json: any): string | null {
+  if (json._server_messages) {
+    try {
+      const arr = JSON.parse(json._server_messages);
+      if (Array.isArray(arr) && arr.length > 0) {
+        const first = typeof arr[0] === 'string' ? JSON.parse(arr[0]) : arr[0];
+        if (first?.message) return first.message;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  if (json.message) return json.message;
+  return null;
+}
+
+export async function call<T = any>(
+  method: string,
+  params?: Record<string, any>,
+  signal?: AbortSignal
+): Promise<T> {
+  const hasParams = params && Object.keys(params).length > 0;
+  let response: Response;
+  try {
+    if (hasParams) {
+      await ensureCsrfToken();
+      response = await fetch(`${FRAPPE_URL}/api/method/${method}`, {
+        method: 'POST',
+        headers: getHeaders(true),
+        credentials: 'include',
+        body: JSON.stringify(params),
+        signal,
+      });
+    } else {
+      response = await fetch(`${FRAPPE_URL}/api/method/${method}`, {
+        method: 'GET',
+        headers: getHeaders(false),
+        credentials: 'include',
+        signal,
+      });
+    }
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') throw err;
+    throw new Error('Server unavailable. Please try again later.');
+  }
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ message: 'Request failed' }));
-    throw new Error(error.message || error.exc || 'Request failed');
+    const body = await response.text().catch(() => '');
+    let message: string;
+    try {
+      const json = JSON.parse(body);
+      message = extractServerMessage(json) || `Server error (${response.status})`;
+    } catch {
+      if (response.status >= 500) {
+        message = 'Server unavailable. Please try again later.';
+      } else if (response.status === 403) {
+        message = 'Access denied';
+      } else if (response.status === 401) {
+        message = 'Session expired. Please log in again.';
+      } else if (response.status === 404) {
+        message = 'Not found';
+      } else {
+        message = `Request failed (${response.status})`;
+      }
+    }
+    throw new Error(message);
   }
 
   const result = await response.json();
   return result.message;
 }
 
-// useResource hook - Similar to frappe-ui's createResource
 export function useResource<T = any>(options: ResourceOptions): Resource<T> {
   const [data, setData] = useState<T | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
 
-  const fetchData = useCallback(async (overrideParams?: Record<string, any>): Promise<T> => {
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await call<T>(options.method, { ...options.params, ...overrideParams });
-      const transformed = options.transform ? options.transform(result) : result;
-      setData(transformed);
-      options.onSuccess?.(transformed);
-      return transformed;
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error('Unknown error');
-      setError(error);
-      options.onError?.(error);
-      throw error;
-    } finally {
-      setLoading(false);
-    }
-  }, [options.method, JSON.stringify(options.params)]);
+  const fetchData = useCallback(
+    async (overrideParams?: Record<string, any>): Promise<T> => {
+      setLoading(true);
+      setError(null);
+      try {
+        const result = await call<T>(options.method, { ...options.params, ...overrideParams });
+        const transformed = options.transform ? options.transform(result) : result;
+        setData(transformed);
+        options.onSuccess?.(transformed);
+        return transformed;
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error('Unknown error');
+        setError(error);
+        options.onError?.(error);
+        throw error;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [options.method, JSON.stringify(options.params)]
+  );
 
   useEffect(() => {
     if (options.auto) fetchData();
   }, [options.auto, fetchData]);
 
   return {
-    data, loading, error,
+    data,
+    loading,
+    error,
     fetch: fetchData,
     reload: () => fetchData(),
     submit: fetchData,
-    reset: () => { setData(null); setError(null); setLoading(false); },
+    reset: () => {
+      setData(null);
+      setError(null);
+      setLoading(false);
+    },
   };
 }
 
-// useListResource - For fetching lists of documents  
 export function useListResource<T = any>(options: ListResourceOptions) {
   const [data, setData] = useState<T[]>([]);
   const [loading, setLoading] = useState(false);
@@ -596,30 +774,42 @@ export function useListResource<T = any>(options: ListResourceOptions) {
   const [hasNextPage, setHasNextPage] = useState(true);
   const limit = options.limit || 20;
 
-  const fetchList = useCallback(async (reset = true): Promise<T[]> => {
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await call<T[]>('frappe.client.get_list', {
-        doctype: options.doctype,
-        fields: options.fields || ['*'],
-        filters: options.filters,
-        order_by: options.orderBy,
-        limit_page_length: limit,
-        limit_start: reset ? 0 : start,
-      });
-      if (reset) { setData(result); setStart(limit); }
-      else { setData(prev => [...prev, ...result]); setStart(prev => prev + limit); }
-      setHasNextPage(result.length === limit);
-      return result;
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error('Unknown error');
-      setError(error);
-      throw error;
-    } finally { setLoading(false); }
-  }, [options.doctype, JSON.stringify(options.filters), options.orderBy, limit, start]);
+  const fetchList = useCallback(
+    async (reset = true): Promise<T[]> => {
+      setLoading(true);
+      setError(null);
+      try {
+        const result = await call<T[]>('frappe.client.get_list', {
+          doctype: options.doctype,
+          fields: options.fields || ['*'],
+          filters: options.filters,
+          order_by: options.orderBy,
+          limit_page_length: limit,
+          limit_start: reset ? 0 : start,
+        });
+        if (reset) {
+          setData(result);
+          setStart(limit);
+        } else {
+          setData((prev) => [...prev, ...result]);
+          setStart((prev) => prev + limit);
+        }
+        setHasNextPage(result.length === limit);
+        return result;
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error('Unknown error');
+        setError(error);
+        throw error;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [options.doctype, JSON.stringify(options.filters), options.orderBy, limit, start]
+  );
 
-  useEffect(() => { if (options.auto) fetchList(); }, [options.auto]);
+  useEffect(() => {
+    if (options.auto) fetchList();
+  }, [options.auto]);
 
   const insert = async (doc: Partial<T>): Promise<T> => {
     const result = await call<T>('frappe.client.insert', { doc: { doctype: options.doctype, ...doc } });
@@ -633,7 +823,11 @@ export function useListResource<T = any>(options: ListResourceOptions) {
   };
 
   return {
-    data, list: data, loading, error, hasNextPage,
+    data,
+    list: data,
+    loading,
+    error,
+    hasNextPage,
     fetch: () => fetchList(true),
     reload: () => fetchList(true),
     loadMore: () => fetchList(false),
@@ -642,7 +836,6 @@ export function useListResource<T = any>(options: ListResourceOptions) {
   };
 }
 
-// useDocResource - For single document operations
 export function useDocResource<T = any>(options: DocResourceOptions) {
   const [doc, setDoc] = useState<T | null>(null);
   const [localChanges, setLocalChanges] = useState<Record<string, any>>({});
@@ -650,29 +843,36 @@ export function useDocResource<T = any>(options: DocResourceOptions) {
   const [error, setError] = useState<Error | null>(null);
   const [docName, setDocName] = useState(options.name);
 
-  const fetchDoc = useCallback(async (name?: string): Promise<T> => {
-    const targetName = name || docName;
-    if (!targetName) throw new Error('Document name is required');
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await call<T>('frappe.client.get', { doctype: options.doctype, name: targetName });
-      setDoc(result);
-      setDocName(targetName);
-      setLocalChanges({});
-      return result;
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error('Unknown error');
-      setError(error);
-      throw error;
-    } finally { setLoading(false); }
-  }, [options.doctype, docName]);
+  const fetchDoc = useCallback(
+    async (name?: string): Promise<T> => {
+      const targetName = name || docName;
+      if (!targetName) throw new Error('Document name is required');
+      setLoading(true);
+      setError(null);
+      try {
+        const result = await call<T>('frappe.client.get', { doctype: options.doctype, name: targetName });
+        setDoc(result);
+        setDocName(targetName);
+        setLocalChanges({});
+        return result;
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error('Unknown error');
+        setError(error);
+        throw error;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [options.doctype, docName]
+  );
 
-  useEffect(() => { if (options.auto && options.name) fetchDoc(options.name); }, [options.auto, options.name]);
+  useEffect(() => {
+    if (options.auto && options.name) fetchDoc(options.name);
+  }, [options.auto, options.name]);
 
   const setValue = (field: string, value: any) => {
-    setLocalChanges(prev => ({ ...prev, [field]: value }));
-    setDoc(prev => prev ? { ...prev, [field]: value } as T : null);
+    setLocalChanges((prev) => ({ ...prev, [field]: value }));
+    setDoc((prev) => (prev ? { ...prev, [field]: value } as T : null));
   };
 
   const save = async (): Promise<T> => {
@@ -683,7 +883,9 @@ export function useDocResource<T = any>(options: DocResourceOptions) {
       setDoc(result);
       setLocalChanges({});
       return result;
-    } finally { setLoading(false); }
+    } finally {
+      setLoading(false);
+    }
   };
 
   const deleteDoc = async (): Promise<void> => {
@@ -696,11 +898,12 @@ export function useDocResource<T = any>(options: DocResourceOptions) {
   return { doc, loading, error, fetch: fetchDoc, reload: () => fetchDoc(), setValue, save, delete: deleteDoc };
 }
 
-// Frappe Context
 interface FrappeContextType {
   call: typeof call;
   user: string | null;
   isLoggedIn: boolean;
+  authLoading: boolean;
+  serverUp: boolean;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshUser: () => Promise<void>;
@@ -710,40 +913,94 @@ const FrappeContext = createContext<FrappeContextType | null>(null);
 
 export function FrappeProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [serverUp, setServerUp] = useState(true);
 
-  const refreshUser = async () => {
+  const refreshUser = useCallback(async () => {
     try {
-      const result = await call<string>('frappe.auth.get_logged_user');
-      setUser(result);
-    } catch { setUser(null); }
-  };
+      const result = await call<string>(`${API}.get_logged_user`);
+      setUser(result && result !== 'Guest' ? result : null);
+      setServerUp(true);
+    } catch (err) {
+      setUser(null);
+      const msg = err instanceof Error ? err.message : '';
+      setServerUp(!msg.includes('unavailable'));
+    } finally {
+      setAuthLoading(false);
+    }
+  }, []);
 
-  const login = async (email: string, password: string) => {
-    const response = await fetch(`${FRAPPE_URL}/api/method/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ usr: email, pwd: password }),
-    });
+  const login = useCallback(async (email: string, password: string) => {
+    let response: Response;
+    try {
+      response = await fetch(`${FRAPPE_URL}/api/method/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ usr: email, pwd: password }),
+      });
+    } catch {
+      throw new Error('Server unavailable. Please try again later.');
+    }
+
     if (!response.ok) {
       const error = await response.json().catch(() => ({ message: 'Login failed' }));
       throw new Error(error.message || 'Login failed');
     }
-    await refreshUser();
-  };
 
-  const logout = async () => {
-    await fetch(`${FRAPPE_URL}/api/method/logout`, { method: 'POST', credentials: 'include' });
+    _csrfToken = null;
+
+    try {
+      const keys = await call<{ api_key: string; api_secret: string }>(`${API}.get_auth_token`);
+      if (keys?.api_key && keys?.api_secret) {
+        setAuthToken(`${keys.api_key}:${keys.api_secret}`);
+      }
+    } catch {
+      /* token auth optional */
+    }
+
+    const result = await call<string>(`${API}.get_logged_user`);
+    setUser(result && result !== 'Guest' ? result : null);
+    setServerUp(true);
+    setAuthLoading(false);
+  }, []);
+
+  const logout = useCallback(async () => {
+    try {
+      await fetch(`${FRAPPE_URL}/api/method/logout`, {
+        method: 'POST',
+        headers: getHeaders(),
+        credentials: 'include',
+      });
+    } catch {
+      /* offline */
+    }
+    setAuthToken(null);
+    _csrfToken = null;
     setUser(null);
-  };
+  }, []);
 
-  useEffect(() => { refreshUser(); }, []);
+  useEffect(() => {
+    refreshUser();
+  }, [refreshUser]);
 
-  return (
-    <FrappeContext.Provider value={{ call, user, isLoggedIn: !!user && user !== 'Guest', login, logout, refreshUser }}>
-      {children}
-    </FrappeContext.Provider>
+  const isLoggedIn = !!user && user !== 'Guest';
+
+  const value = useMemo<FrappeContextType>(
+    () => ({
+      call,
+      user,
+      isLoggedIn,
+      authLoading,
+      serverUp,
+      login,
+      logout,
+      refreshUser,
+    }),
+    [user, isLoggedIn, authLoading, serverUp, login, logout, refreshUser]
   );
+
+  return <FrappeContext.Provider value={value}>{children}</FrappeContext.Provider>;
 }
 
 export function useFrappe() {
@@ -752,7 +1009,6 @@ export function useFrappe() {
   return context;
 }
 
-// Aliases for frappe-ui compatibility
 export const createResource = useResource;
 export const createListResource = useListResource;
 export const createDocumentResource = useDocResource;
@@ -761,22 +1017,113 @@ export const createDocumentResource = useDocResource;
 # createResource and Frappe utilities (JavaScript)
 NEXTJS_FRAPPE_LIB_JS = """'use client';
 
-import { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
 
-// Use empty string in dev to go through Next.js rewrites proxy (avoids CORS)
 const FRAPPE_URL = '';
+const API = '{{ app_package }}.api';
 
-export async function call(method, params) {
-  const response = await fetch(`${FRAPPE_URL}/api/method/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-    credentials: 'include',
-    body: JSON.stringify(params || {}),
-  });
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ message: 'Request failed' }));
-    throw new Error(error.message || error.exc || 'Request failed');
+let _authToken = null;
+let _csrfToken = null;
+
+function setAuthToken(token) {
+  _authToken = token;
+}
+
+export function getAuthToken() {
+  return _authToken;
+}
+
+function getHeaders(includeBody) {
+  if (includeBody === undefined) includeBody = true;
+  const headers = { Accept: 'application/json' };
+  if (includeBody) headers['Content-Type'] = 'application/json';
+  if (_authToken) headers['Authorization'] = 'token ' + _authToken;
+  if (_csrfToken) headers['X-Frappe-CSRF-Token'] = _csrfToken;
+  return headers;
+}
+
+let _csrfPromise = null;
+
+async function ensureCsrfToken() {
+  if (_csrfToken || _authToken) return;
+  if (_csrfPromise) return _csrfPromise;
+  _csrfPromise = (async () => {
+    try {
+      const res = await fetch(FRAPPE_URL + '/api/method/' + API + '.get_csrf_token', {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        credentials: 'include',
+      });
+      if (res.ok) {
+        const json = await res.json();
+        _csrfToken = json.message ?? null;
+      }
+    } catch {
+      /* optional */
+    }
+  })();
+  await _csrfPromise;
+  _csrfPromise = null;
+}
+
+function extractServerMessage(json) {
+  if (json._server_messages) {
+    try {
+      const arr = JSON.parse(json._server_messages);
+      if (Array.isArray(arr) && arr.length > 0) {
+        const first = typeof arr[0] === 'string' ? JSON.parse(arr[0]) : arr[0];
+        if (first && first.message) return first.message;
+      }
+    } catch {
+      /* ignore */
+    }
   }
+  if (json.message) return json.message;
+  return null;
+}
+
+export async function call(method, params, signal) {
+  const hasParams = params && Object.keys(params).length > 0;
+  let response;
+  try {
+    if (hasParams) {
+      await ensureCsrfToken();
+      response = await fetch(FRAPPE_URL + '/api/method/' + method, {
+        method: 'POST',
+        headers: getHeaders(true),
+        credentials: 'include',
+        body: JSON.stringify(params),
+        signal,
+      });
+    } else {
+      response = await fetch(FRAPPE_URL + '/api/method/' + method, {
+        method: 'GET',
+        headers: getHeaders(false),
+        credentials: 'include',
+        signal,
+      });
+    }
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') throw err;
+    throw new Error('Server unavailable. Please try again later.');
+  }
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    let message;
+    try {
+      const json = JSON.parse(body);
+      message = extractServerMessage(json) || 'Server error (' + response.status + ')';
+    } catch {
+      if (response.status >= 500) message = 'Server unavailable. Please try again later.';
+      else if (response.status === 403) message = 'Access denied';
+      else if (response.status === 401) message = 'Session expired. Please log in again.';
+      else if (response.status === 404) message = 'Not found';
+      else message = 'Request failed (' + response.status + ')';
+    }
+    throw new Error(message);
+  }
+
   const result = await response.json();
   return result.message;
 }
@@ -786,28 +1133,43 @@ export function useResource(options) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  const fetchData = useCallback(async (overrideParams) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await call(options.method, { ...options.params, ...overrideParams });
-      const transformed = options.transform ? options.transform(result) : result;
-      setData(transformed);
-      options.onSuccess?.(transformed);
-      return transformed;
-    } catch (err) {
-      setError(err);
-      options.onError?.(err);
-      throw err;
-    } finally { setLoading(false); }
-  }, [options.method, JSON.stringify(options.params)]);
+  const fetchData = useCallback(
+    async (overrideParams) => {
+      setLoading(true);
+      setError(null);
+      try {
+        const result = await call(options.method, { ...options.params, ...overrideParams });
+        const transformed = options.transform ? options.transform(result) : result;
+        setData(transformed);
+        if (options.onSuccess) options.onSuccess(transformed);
+        return transformed;
+      } catch (err) {
+        setError(err);
+        if (options.onError) options.onError(err);
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [options.method, JSON.stringify(options.params)]
+  );
 
-  useEffect(() => { if (options.auto) fetchData(); }, [options.auto, fetchData]);
+  useEffect(() => {
+    if (options.auto) fetchData();
+  }, [options.auto, fetchData]);
 
   return {
-    data, loading, error,
-    fetch: fetchData, reload: () => fetchData(), submit: fetchData,
-    reset: () => { setData(null); setError(null); setLoading(false); },
+    data,
+    loading,
+    error,
+    fetch: fetchData,
+    reload: () => fetchData(),
+    submit: fetchData,
+    reset: () => {
+      setData(null);
+      setError(null);
+      setLoading(false);
+    },
   };
 }
 
@@ -819,29 +1181,61 @@ export function useListResource(options) {
   const [hasNextPage, setHasNextPage] = useState(true);
   const limit = options.limit || 20;
 
-  const fetchList = useCallback(async (reset = true) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await call('frappe.client.get_list', {
-        doctype: options.doctype, fields: options.fields || ['*'], filters: options.filters,
-        order_by: options.orderBy, limit_page_length: limit, limit_start: reset ? 0 : start,
-      });
-      if (reset) { setData(result); setStart(limit); }
-      else { setData(prev => [...prev, ...result]); setStart(prev => prev + limit); }
-      setHasNextPage(result.length === limit);
-      return result;
-    } catch (err) { setError(err); throw err; }
-    finally { setLoading(false); }
-  }, [options.doctype, JSON.stringify(options.filters), options.orderBy, limit, start]);
+  const fetchList = useCallback(
+    async (reset) => {
+      if (reset === undefined) reset = true;
+      setLoading(true);
+      setError(null);
+      try {
+        const result = await call('frappe.client.get_list', {
+          doctype: options.doctype,
+          fields: options.fields || ['*'],
+          filters: options.filters,
+          order_by: options.orderBy,
+          limit_page_length: limit,
+          limit_start: reset ? 0 : start,
+        });
+        if (reset) {
+          setData(result);
+          setStart(limit);
+        } else {
+          setData((prev) => [...prev, ...result]);
+          setStart((prev) => prev + limit);
+        }
+        setHasNextPage(result.length === limit);
+        return result;
+      } catch (err) {
+        setError(err);
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [options.doctype, JSON.stringify(options.filters), options.orderBy, limit, start]
+  );
 
-  useEffect(() => { if (options.auto) fetchList(); }, [options.auto]);
+  useEffect(() => {
+    if (options.auto) fetchList();
+  }, [options.auto]);
 
   return {
-    data, list: data, loading, error, hasNextPage,
-    fetch: () => fetchList(true), reload: () => fetchList(true), loadMore: () => fetchList(false),
-    insert: async (doc) => { const r = await call('frappe.client.insert', { doc: { doctype: options.doctype, ...doc } }); await fetchList(); return r; },
-    delete: async (name) => { await call('frappe.client.delete', { doctype: options.doctype, name }); await fetchList(); },
+    data,
+    list: data,
+    loading,
+    error,
+    hasNextPage,
+    fetch: () => fetchList(true),
+    reload: () => fetchList(true),
+    loadMore: () => fetchList(false),
+    insert: async (doc) => {
+      const r = await call('frappe.client.insert', { doc: { doctype: options.doctype, ...doc } });
+      await fetchList();
+      return r;
+    },
+    delete: async (name) => {
+      await call('frappe.client.delete', { doctype: options.doctype, name });
+      await fetchList();
+    },
   };
 }
 
@@ -852,26 +1246,60 @@ export function useDocResource(options) {
   const [error, setError] = useState(null);
   const [docName, setDocName] = useState(options.name);
 
-  const fetchDoc = useCallback(async (name) => {
-    const targetName = name || docName;
-    if (!targetName) throw new Error('Document name is required');
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await call('frappe.client.get', { doctype: options.doctype, name: targetName });
-      setDoc(result); setDocName(targetName); setLocalChanges({});
-      return result;
-    } catch (err) { setError(err); throw err; }
-    finally { setLoading(false); }
-  }, [options.doctype, docName]);
+  const fetchDoc = useCallback(
+    async (name) => {
+      const targetName = name || docName;
+      if (!targetName) throw new Error('Document name is required');
+      setLoading(true);
+      setError(null);
+      try {
+        const result = await call('frappe.client.get', { doctype: options.doctype, name: targetName });
+        setDoc(result);
+        setDocName(targetName);
+        setLocalChanges({});
+        return result;
+      } catch (err) {
+        setError(err);
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [options.doctype, docName]
+  );
 
-  useEffect(() => { if (options.auto && options.name) fetchDoc(options.name); }, [options.auto, options.name]);
+  useEffect(() => {
+    if (options.auto && options.name) fetchDoc(options.name);
+  }, [options.auto, options.name]);
 
   return {
-    doc, loading, error, fetch: fetchDoc, reload: () => fetchDoc(),
-    setValue: (field, value) => { setLocalChanges(prev => ({ ...prev, [field]: value })); setDoc(prev => prev ? { ...prev, [field]: value } : null); },
-    save: async () => { if (!doc || !docName) throw new Error('No document to save'); setLoading(true); try { const r = await call('frappe.client.save', { doc: { ...doc, ...localChanges } }); setDoc(r); setLocalChanges({}); return r; } finally { setLoading(false); } },
-    delete: async () => { if (!docName) throw new Error('No document to delete'); await call('frappe.client.delete', { doctype: options.doctype, name: docName }); setDoc(null); setDocName(undefined); },
+    doc,
+    loading,
+    error,
+    fetch: fetchDoc,
+    reload: () => fetchDoc(),
+    setValue: (field, value) => {
+      setLocalChanges((prev) => ({ ...prev, [field]: value }));
+      setDoc((prev) => (prev ? { ...prev, [field]: value } : null));
+    },
+    save: async () => {
+      if (!doc || !docName) throw new Error('No document to save');
+      setLoading(true);
+      try {
+        const r = await call('frappe.client.save', { doc: { ...doc, ...localChanges } });
+        setDoc(r);
+        setLocalChanges({});
+        return r;
+      } finally {
+        setLoading(false);
+      }
+    },
+    delete: async () => {
+      if (!docName) throw new Error('No document to delete');
+      await call('frappe.client.delete', { doctype: options.doctype, name: docName });
+      setDoc(null);
+      setDocName(undefined);
+    },
   };
 }
 
@@ -879,29 +1307,77 @@ const FrappeContext = createContext(null);
 
 export function FrappeProvider({ children }) {
   const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [serverUp, setServerUp] = useState(true);
 
-  const refreshUser = async () => {
-    try { const result = await call('frappe.auth.get_logged_user'); setUser(result); }
-    catch { setUser(null); }
-  };
+  const refreshUser = useCallback(async () => {
+    try {
+      const result = await call(API + '.get_logged_user');
+      setUser(result && result !== 'Guest' ? result : null);
+      setServerUp(true);
+    } catch (err) {
+      setUser(null);
+      const msg = err instanceof Error ? err.message : '';
+      setServerUp(!msg.includes('unavailable'));
+    } finally {
+      setAuthLoading(false);
+    }
+  }, []);
 
-  const login = async (email, password) => {
-    const response = await fetch(`${FRAPPE_URL}/api/method/login`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
-      body: JSON.stringify({ usr: email, pwd: password }),
-    });
-    if (!response.ok) { const error = await response.json().catch(() => ({ message: 'Login failed' })); throw new Error(error.message || 'Login failed'); }
-    await refreshUser();
-  };
+  const login = useCallback(async (email, password) => {
+    let response;
+    try {
+      response = await fetch(FRAPPE_URL + '/api/method/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ usr: email, pwd: password }),
+      });
+    } catch {
+      throw new Error('Server unavailable. Please try again later.');
+    }
+    if (!response.ok) {
+      const e = await response.json().catch(() => ({ message: 'Login failed' }));
+      throw new Error(e.message || 'Login failed');
+    }
+    _csrfToken = null;
+    try {
+      const keys = await call(API + '.get_auth_token');
+      if (keys && keys.api_key && keys.api_secret) {
+        setAuthToken(keys.api_key + ':' + keys.api_secret);
+      }
+    } catch {
+      /* optional */
+    }
+    const u = await call(API + '.get_logged_user');
+    setUser(u && u !== 'Guest' ? u : null);
+    setServerUp(true);
+    setAuthLoading(false);
+  }, []);
 
-  const logout = async () => {
-    await fetch(`${FRAPPE_URL}/api/method/logout`, { method: 'POST', credentials: 'include' });
+  const logout = useCallback(async () => {
+    try {
+      await fetch(FRAPPE_URL + '/api/method/logout', { method: 'POST', headers: getHeaders(), credentials: 'include' });
+    } catch {
+      /* offline */
+    }
+    setAuthToken(null);
+    _csrfToken = null;
     setUser(null);
-  };
+  }, []);
 
-  useEffect(() => { refreshUser(); }, []);
+  useEffect(() => {
+    refreshUser();
+  }, [refreshUser]);
 
-  return <FrappeContext.Provider value={{ call, user, isLoggedIn: !!user && user !== 'Guest', login, logout, refreshUser }}>{children}</FrappeContext.Provider>;
+  const isLoggedIn = !!user && user !== 'Guest';
+
+  const value = useMemo(
+    () => ({ call, user, isLoggedIn, authLoading, serverUp, login, logout, refreshUser }),
+    [user, isLoggedIn, authLoading, serverUp, login, logout, refreshUser]
+  );
+
+  return <FrappeContext.Provider value={value}>{children}</FrappeContext.Provider>;
 }
 
 export function useFrappe() {
